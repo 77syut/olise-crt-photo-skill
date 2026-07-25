@@ -14,6 +14,8 @@ def parse_args():
     parser.add_argument("output", type=Path)
     parser.add_argument("--title", default="SCENE TEST")
     parser.add_argument("--mode", default="STATIC")
+    parser.add_argument("--before-label", default="ORIGINAL")
+    parser.add_argument("--after-label", default="OLISE CRT")
     return parser.parse_args()
 
 
@@ -77,7 +79,10 @@ def main():
         after, after_mask = rounded_card(result, card_size)
 
     for index, (label, image, mask) in enumerate(
-        (("ORIGINAL", before, before_mask), ("OLISE CRT", after, after_mask))
+        (
+            (args.before_label, before, before_mask),
+            (args.after_label, after, after_mask),
+        )
     ):
         x = left + index * (card_size[0] + gap)
         shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
