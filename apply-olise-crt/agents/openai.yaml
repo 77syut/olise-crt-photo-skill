@@ -1,0 +1,4 @@
+interface:
+  display_name: "Olise CRT Photo"
+  short_description: "Apply adaptive cold-cyan CRT camcorder styling"
+  default_prompt: "使用 $apply-olise-crt：我想制作 Olise/奥利塞同款失真照片。"
