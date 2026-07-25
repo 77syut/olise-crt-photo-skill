@@ -18,6 +18,8 @@
 
 ## 对比
 
+![四类场景效果总览](docs/assets/comparisons/00-comparison-overview.jpg)
+
 ### 强动态球场
 
 强动态仅增加边缘鱼眼，人物、球和看台仍可辨认。
