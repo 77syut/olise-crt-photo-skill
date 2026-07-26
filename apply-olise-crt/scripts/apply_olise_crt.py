@@ -28,6 +28,18 @@ def parse_args():
         help="Auto uses macOS Vision; explicit levels override recognition.",
     )
     parser.add_argument("--quality", type=int, default=94)
+    parser.add_argument(
+        "--motion-strength",
+        type=float,
+        default=1.0,
+        help="Scale short CRT persistence from 0.0 to 2.0.",
+    )
+    parser.add_argument(
+        "--dream-strength",
+        type=float,
+        default=0.55,
+        help="Scale cyan phosphor aura and CRT signal drift from 0.0 to 1.5.",
+    )
     return parser.parse_args()
 
 
@@ -59,7 +71,15 @@ def main():
             source = ImageOps.exif_transpose(image).convert("RGB")
             original_size = source.size
             result = Image.fromarray(
-                np.uint8(render(source, scene["level"]) * 255)
+                np.uint8(
+                    render(
+                        source,
+                        scene["level"],
+                        motion_strength=max(0.0, min(2.0, args.motion_strength)),
+                        dream_strength=max(0.0, min(1.5, args.dream_strength)),
+                    )
+                    * 255
+                )
             )
         if result.size != original_size:
             raise RuntimeError(f"Size changed unexpectedly: {path}")

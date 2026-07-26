@@ -46,13 +46,21 @@ def mild_fisheye(a, strength=0.010):
     ny = (yy - (h - 1) / 2) / max((h - 1) / 2, 1)
     r2 = nx * nx + ny * ny
     factor = 1.0 + strength * r2
-    sx = (nx * factor + 1.0) * (w - 1) / 2
-    sy = (ny * factor + 1.0) * (h - 1) / 2
-    return bilinear_sample(a, sx, sy)
+    warped_x = nx * factor
+    warped_y = ny * factor
+    sx = (warped_x + 1.0) * (w - 1) / 2
+    sy = (warped_y + 1.0) * (h - 1) / 2
+    sampled = bilinear_sample(a, sx, sy)
+
+    # Clamped sampling creates barcode-like stretched borders. Fade the virtual
+    # screen as the warped coordinates approach or leave its valid face.
+    screen_edge = np.maximum(np.abs(warped_x), np.abs(warped_y))
+    screen_mask = 1.0 - _smoothstep(0.982, 1.024, screen_edge)
+    return sampled * (0.72 + 0.28 * screen_mask[..., None])
 
 
-def pixelate_and_blur(image):
-    """FCP-like softening, scaled so small screenshots do not turn to mush."""
+def pixelate_and_blur(image, motion_level="static"):
+    """CRT softness without using whole-frame blur as the motion effect."""
     image = ImageOps.exif_transpose(image).convert("RGB")
     w, h = image.size
     short_edge = min(w, h)
@@ -61,16 +69,23 @@ def pixelate_and_blur(image):
         Image.Resampling.BOX,
     )
     pixelated = low.resize((w, h), Image.Resampling.NEAREST)
+    motion_index = {
+        "static": 0,
+        "mild": 1,
+        "sports": 2,
+    }[motion_level]
     if short_edge < 480:
         # Phone-video reposts have already been resized and compressed once.
         # Keep the CRT softness, but retain UI type and the subject silhouette.
-        pixelated = Image.blend(image, pixelated, 0.46)
-        blur_radius = 0.58
+        pixel_mix = (0.24, 0.28, 0.33)[motion_index]
+        blur_radius = (0.26, 0.30, 0.35)[motion_index]
     elif short_edge < 720:
-        pixelated = Image.blend(image, pixelated, 0.74)
-        blur_radius = 0.92
+        pixel_mix = (0.45, 0.49, 0.54)[motion_index]
+        blur_radius = (0.45, 0.50, 0.56)[motion_index]
     else:
-        blur_radius = 1.25
+        pixel_mix = (0.58, 0.62, 0.66)[motion_index]
+        blur_radius = (0.55, 0.58, 0.62)[motion_index]
+    pixelated = Image.blend(image, pixelated, pixel_mix)
     return pixelated.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
 
@@ -274,28 +289,197 @@ def lift_saturation_and_teal(a):
     return clip(y + (a - y) * 1.075)
 
 
-def dual_scan_screen(a):
-    """Two perpendicular, differently stretched screen layers."""
+def dual_scan_screen(a, motion_level="static"):
+    """CRT RGB grille, scanlines, and scene-scaled field instability."""
     h, w = a.shape[:2]
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    base_pitch = max(4.5, w / 235.0)
 
+    # A filmed screen is never perfectly synchronized. Sports gets a stronger
+    # rolling field slip instead of a longer synthetic motion blur.
+    if motion_level == "sports":
+        band = np.exp(
+            -0.5 * ((yy - h * 0.53) / max(h * 0.12, 1.0)) ** 2
+        )
+        field_shift = 0.65 * np.sin(yy / 7.5) + band * 2.40
+        a = bilinear_sample(a, xx + field_shift, yy)
+        # Odd/even fields capture motion at slightly different instants.
+        # Blend alternating two-line groups to form restrained broadcast combing.
+        delayed_field = bilinear_sample(a, xx + max(1.4, w / 620.0), yy)
+        field_rows = ((yy.astype(np.int32) // 2) % 2).astype(np.float32)
+        field_mix = (field_rows * 0.32)[..., None]
+        a = a * (1.0 - field_mix) + delayed_field * field_mix
+    elif motion_level == "mild":
+        field_shift = 0.25 * np.sin(yy / 9.0)
+        a = bilinear_sample(a, xx + field_shift, yy)
+
+    # Consumer CRT chroma registration: luma remains legible while red and
+    # blue resolve on slightly different columns.
+    register_px = max(0.55, min(1.35, w / 1050.0))
+    registered = a.copy()
+    registered[..., 0] = bilinear_sample(
+        a, xx - register_px, yy
+    )[..., 0]
+    registered[..., 2] = bilinear_sample(
+        a, xx + register_px, yy
+    )[..., 2]
+    register_mix = {
+        "static": 0.38,
+        "mild": 0.47,
+        "sports": 0.56,
+    }[motion_level]
+    a = a * (1.0 - register_mix) + registered * register_mix
+
+    scan_pitch = max(4.2, w / 250.0)
     horizontal = np.sin(
-        2 * math.pi * (yy / base_pitch + 0.035 * np.sin(xx / 137.0))
+        2 * math.pi * (yy / scan_pitch + 0.025 * np.sin(xx / 151.0))
     )
-    vertical_pitch = base_pitch * 1.72
-    vertical = np.sin(
-        2 * math.pi * (xx / vertical_pitch + 0.055 * np.sin(yy / 109.0))
+    triad_pitch = max(2.8, w / 330.0)
+    phase = 2 * math.pi * (
+        xx / triad_pitch
+        + 0.040 * np.sin(yy / 91.0)
+        + 0.020 * np.sin((xx + yy) / 173.0)
     )
-    fine_vertical = np.sin(2 * math.pi * xx / max(2.6, base_pitch * 0.66))
-    local = 0.72 + 0.28 * np.sin(xx / 251.0 + yy / 313.0)
+    triad_strength = {
+        "static": 0.085,
+        "mild": 0.105,
+        "sports": 0.130,
+    }[motion_level]
+    phosphor = np.empty_like(a)
+    phosphor[..., 0] = 1.0 + triad_strength * np.cos(phase)
+    phosphor[..., 1] = 1.0 + triad_strength * np.cos(
+        phase - 2 * math.pi / 3
+    )
+    phosphor[..., 2] = 1.0 + triad_strength * np.cos(
+        phase - 4 * math.pi / 3
+    )
+    vertical_grille = np.sin(phase) * 0.034
+    diagonal = np.sin(2 * math.pi * (xx / 181.0 - yy / 239.0))
+    a *= phosphor
     a *= (
         1.0
-        + horizontal[..., None] * 0.030
-        + vertical[..., None] * local[..., None] * 0.022
-        + fine_vertical[..., None] * 0.007
+        + horizontal[..., None] * 0.018
+        + vertical_grille[..., None]
+        + diagonal[..., None] * 0.015
     )
-    return a
+    return clip(a)
+
+
+def dream_signal(a, strength=0.55):
+    """Low-frequency CRT aura and signal drift without a purple wash."""
+    strength = float(np.clip(strength, 0.0, 1.5))
+    if strength <= 0.0:
+        return a
+
+    h, w = a.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    y = luma(a)
+
+    # Let color resolve slightly more slowly than luma, like consumer CRT
+    # chroma bandwidth rather than ordinary Gaussian defocus.
+    color_layer = Image.fromarray(np.uint8(clip(a) * 255)).filter(
+        ImageFilter.GaussianBlur(radius=max(0.8, min(w, h) * 0.0018))
+    )
+    color_layer = np.asarray(color_layer, np.float32) / 255.0
+    chroma_bleed = np.clip(0.18 * strength, 0.0, 0.26)
+    y_base = y[..., None]
+    soft_y = luma(color_layer)[..., None]
+    a = (
+        y_base
+        + (a - y_base) * (1.0 - chroma_bleed)
+        + (color_layer - soft_y) * chroma_bleed
+    )
+
+    # A broad cyan-white phosphor aura around luminous screen content.
+    bright = _smoothstep(0.48, 0.88, y)[..., None]
+    glow_source = clip(a) * bright
+    aura = Image.fromarray(np.uint8(glow_source * 255)).filter(
+        ImageFilter.GaussianBlur(radius=max(3.0, min(w, h) * 0.024))
+    )
+    aura = np.asarray(aura, np.float32) / 255.0
+    aura *= np.array([0.74, 1.00, 1.10], np.float32)
+    aura_mix = 0.240 * strength
+    a = 1.0 - (1.0 - clip(a)) * (1.0 - clip(aura) * aura_mix)
+
+    # Large, slowly varying chroma clouds read as unstable CRT memory rather
+    # than a flat teal overlay. Keep them strongest in shadows and mids.
+    cloud_a = np.sin(xx / 121.0 + yy / 173.0 + 0.7)
+    cloud_b = np.sin(xx / 263.0 - yy / 149.0 + 1.9)
+    cloud = (cloud_a * 0.62 + cloud_b * 0.38)[..., None]
+    shadow = np.power(1.0 - y, 1.65)[..., None]
+    mid = np.clip(1.0 - np.abs(y - 0.43) * 2.35, 0.0, 1.0)[..., None]
+    a += (
+        cloud
+        * (
+            shadow * np.array([-0.005, 0.006, 0.012], np.float32)
+            + mid * np.array([-0.008, 0.008, 0.016], np.float32)
+        )
+        * strength
+    )
+
+    # A broad rolling exposure band and diagonal interference make the screen
+    # feel captured at an instant, not generated as a perfectly flat overlay.
+    band_center = h * (0.42 + 0.07 * math.sin(w * 0.013))
+    band = np.exp(
+        -0.5 * ((yy - band_center) / max(h * 0.16, 1.0)) ** 2
+    )
+    band -= band.mean()
+    interference = np.sin(2 * math.pi * (xx / 197.0 - yy / 257.0 + 0.23))
+    a *= (
+        1.0
+        + band[..., None] * (0.026 * strength)
+        + interference[..., None] * (0.0070 * strength)
+    )
+
+    # Deterministic fine luma grain: enough to break digital cleanliness,
+    # never enough to read as modern film-grain software.
+    seed = int((w * 73856093) ^ (h * 19349663)) & 0xFFFFFFFF
+    grain = np.random.default_rng(seed).normal(
+        0.0,
+        0.0060 * strength,
+        (h, w, 1),
+    ).astype(np.float32)
+    return clip(a + grain)
+
+
+def phosphor_persistence(a, motion_level, intensity=1.0):
+    """Scaled-down continuous shutter persistence, not discrete copied ghosts."""
+    if motion_level == "static":
+        return a
+    intensity = float(np.clip(intensity, 0.0, 2.0))
+
+    h, w = a.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    y = luma(a)
+    gx = np.zeros_like(y)
+    gy = np.zeros_like(y)
+    gx[:, 1:] = np.abs(y[:, 1:] - y[:, :-1])
+    gy[1:, :] = np.abs(y[1:, :] - y[:-1, :])
+    edge = _smoothstep(0.012, 0.105, np.sqrt(gx * gx + gy * gy))
+    bright = _smoothstep(0.56, 0.90, y)
+
+    if motion_level == "mild":
+        max_x_ratio, max_y_ratio = 0.004, 0.0008
+        trail_mix, samples = 0.050, 7
+    else:
+        max_x_ratio, max_y_ratio = 0.010, 0.0020
+        trail_mix, samples = 0.100, 9
+
+    max_dx = w * max_x_ratio * intensity
+    max_dy = h * max_y_ratio * intensity
+    trail = np.zeros_like(a)
+    total_weight = 0.0
+    for index in range(samples):
+        t = index / max(samples - 1, 1)
+        weight = math.exp(-2.55 * t)
+        trail += bilinear_sample(a, xx + max_dx * t, yy + max_dy * t) * weight
+        total_weight += weight
+    trail /= max(total_weight, 1e-6)
+
+    # Keep the underlying frame dominant. Edges and bright phosphors carry a
+    # little more persistence, as they would on a filmed CRT.
+    profile = 0.58 + edge * 0.34 + bright * 0.10
+    mask = clip(trail_mix * intensity * profile)[..., None]
+    return clip(a * (1.0 - mask) + trail * mask)
 
 
 def black_edge_and_glow(a):
@@ -305,7 +489,7 @@ def black_edge_and_glow(a):
     nx = np.abs((xx - (w - 1) / 2) / max((w - 1) / 2, 1))
     ny = np.abs((yy - (h - 1) / 2) / max((h - 1) / 2, 1))
     edge = np.maximum(nx, ny)
-    border = 1.0 - 0.16 * clip((edge - 0.89) / 0.11) ** 1.7
+    border = 1.0 - 0.08 * clip((edge - 0.89) / 0.11) ** 1.7
     a *= border[..., None]
 
     median = float(np.median(luma(a)))
@@ -320,19 +504,26 @@ def black_edge_and_glow(a):
     return clip(1.0 - (1.0 - clip(a)) * (1.0 - bloom * glow_strength))
 
 
-def render(image, motion_level="static"):
+def render(
+    image,
+    motion_level="static",
+    motion_strength=1.0,
+    dream_strength=0.55,
+):
     """Render one PIL image while preserving its dimensions and aspect ratio."""
     if motion_level not in MOTION_LEVELS:
         raise ValueError(f"Unknown motion level: {motion_level}")
     normalized = adaptive_white_balance(image)
-    softened = pixelate_and_blur(normalized)
+    softened = pixelate_and_blur(normalized, motion_level)
     a = np.asarray(softened, np.float32) / 255.0
-    a = dual_scan_screen(a)
     a = lift_saturation_and_teal(a)
+    a = phosphor_persistence(a, motion_level, intensity=motion_strength)
+    a = dual_scan_screen(a, motion_level)
+    a = dream_signal(a, strength=dream_strength)
     strength = {
-        "static": 0.010,
-        "mild": 0.016,
-        "sports": 0.022,
+        "static": 0.008,
+        "mild": 0.012,
+        "sports": 0.018,
     }[motion_level]
     a = mild_fisheye(a, strength=strength)
     return black_edge_and_glow(a)
